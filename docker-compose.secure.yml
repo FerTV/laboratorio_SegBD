@@ -1,0 +1,98 @@
+# =====================================================================
+#  ENTORNO ENDURECIDO
+#  - MongoDB con --auth, usuario root solo para administración y usuario
+#    de aplicación con rol readWrite limitado a la BD "tienda"
+#  - Elasticsearch con xpack.security activado, usuario de aplicación con
+#    rol de solo lectura sobre el índice "articulos"
+#  - Ningún puerto de BD publicado: red "backend" interna (internal: true)
+#  - Única entrada: proxy Caddy con TLS en 127.0.0.1:8443
+#  - API segura: Pydantic estricto, rate-limit, logging de seguridad JSON
+#  - Repositorio de snapshots de ES (path.repo) para copias de seguridad
+# =====================================================================
+name: nosql-lab-seguro
+
+services:
+  mongo:
+    image: mongo:7
+    command: ["--auth", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: tienda
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+    volumes:
+      - ./init_mongo_secure.js:/docker-entrypoint-initdb.d/init_mongo_secure.js:ro
+      - mongo-data:/data/db
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      retries: 20
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "true"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      path.repo: /usr/share/elasticsearch/data/snapshots
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:$$ELASTIC_PASSWORD http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(green|yellow)\"'"]
+      interval: 5s
+      retries: 40
+
+  es-init:
+    image: curlimages/curl:8.10.1
+    entrypoint: ["/bin/sh", "/init_elastic.sh"]
+    environment:
+      ES_URL: http://elasticsearch:9200
+      ES_AUTH: elastic:${ELASTIC_PASSWORD}
+      ES_APP_USER: ${ES_APP_USER}
+      ES_APP_PASSWORD: ${ES_APP_PASSWORD}
+    volumes:
+      - ./init_elastic.sh:/init_elastic.sh:ro
+    networks: [backend]
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+
+  fastapi-app:
+    build: ./fastapi-app
+    # Sin "ports": solo es accesible a través del proxy TLS
+    environment:
+      APP_MODULE: main_secure:app
+      MONGO_HOST: mongo
+      MONGO_DATABASE: tienda
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      ELASTIC_HOST: elasticsearch
+      ES_APP_USER: ${ES_APP_USER}
+      ES_APP_PASSWORD: ${ES_APP_PASSWORD}
+      LOGIN_MAX_FAILS: "5"
+      LOGIN_WINDOW_SECONDS: "300"
+      SEARCH_ALERT_PER_MINUTE: "30"
+    networks: [backend, frontend]
+    depends_on:
+      mongo: { condition: service_healthy }
+      es-init: { condition: service_completed_successfully }
+
+  proxy:
+    image: caddy:2.8
+    ports: ["127.0.0.1:8443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [frontend]
+    depends_on: [fastapi-app]
+
+networks:
+  backend:
+    internal: true      # sin salida ni entrada desde el host
+  frontend: {}
+
+volumes:
+  mongo-data: {}
+  es-data: {}
